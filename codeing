@@ -1,0 +1,235 @@
+'''
+baseline
+'''
+
+import os
+import pandas as pd
+import numpy as np
+import datetime
+import requests
+import json
+from sklearn.model_selection import StratifiedKFold,GridSearchCV,train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import f1_score,roc_auc_score,roc_curve,auc,accuracy_score,precision_score
+from sklearn.preprocessing import OneHotEncoder,LabelEncoder
+import lightgbm as lgb
+import gc
+from tqdm import tqdm
+import time
+import datetime
+
+#读取数据文件 训练集
+train_path = '/mnt/5/Alert_BTS_HW_1001-0309'
+# 0316-0322 测试集1
+test_0322_path = '/mnt/5/Alert_BTS_HW_0316-0322'
+#0324-0330  测试集2
+test_0330_path = '/mnt/5/Alert_BTS_HW_0324-0330'
+
+#返回文件名
+def get_name(path): 
+    fileList = os.listdir(path)
+    filenames=[]# 获取path目录下所有文件    
+    for filename in fileList:        
+        filenames.append(os.path.join(path,filename)) # 获取path与filename组合后的路径
+    return filenames
+
+#训练集和测试集总共有多少种告警类型 生成特征
+def category(filenames):
+    cate=[]
+    for i in range(len(filenames)):#遍历每个文件
+        cate.extend(pd.read_csv(filenames[i])["告警名称"].values)
+    cateSet=list(set(cate))
+    cateDic={}
+    for j in range(len(cateSet)):
+        cateDic[cateSet[j]]=0   
+    return cateDic
+
+#随机下采样
+def lower_sample_data(df, percent=1):   
+    '''    percent:多数类别下采样的数量相对于少数类别样本数量的比例    '''    
+    data0 = df[df['样本类别'] == 0]  # 将多数类别的样本放在data0    
+    data1 = df[df['样本类别'] == 1]  # 将少数类别的样本放在data1    
+    index = np.random.randint(        
+        len(data0), size=percent * (len(df) - len(data0)))  # 随机给定下采样取出样本的序号    
+    lower_data0 = data0.iloc[list(index)]  # 下采样    
+    resample=pd.concat([lower_data0, data1])
+    return resample
+
+def Sample(filenames,cateDic):
+    data=pd.DataFrame(columns=cateDic.keys())
+    sample=pd.DataFrame(columns=["基站名称"]+list(cateDic.keys())+["样本类别"])
+    for i in range(8000):
+        print("第%d个基站···"%(i+1))
+        df1=pd.read_csv(filenames[i])
+        df1['告警开始时间'] = pd.to_datetime(df1['告警开始时间']) #将数据类型转换为日期类型
+        df1 = df1.set_index('告警开始时间') # 将date设置为index
+        df2=df1.groupby(['告警开始时间','告警名称']).size().unstack().fillna(0).resample("D").sum()#按天聚合数据
+        df2=pd.concat([data,df2]).fillna(0)
+        df3 = pd.DataFrame(columns=list(df2.columns)+["样本类别"])
+        for i in range(df2.shape[0]-7):
+            df3=df3.append(df2[i:i+7][:].cumsum()[6:7])
+            if df2[i+7:i+8]["网元连接中断"].values[0]>=1 or df2[i+7:i+8]["小区不可用告警"].values[0]>=1:
+                df3["样本类别"].iloc[i:i+1]=1
+            else:
+                df3["样本类别"].iloc[i:i+1]=0
+        df3.insert(0,"基站名称",[df1["基站名称"].values[0]]*df3.shape[0])
+        sample=pd.concat([sample,df3])
+    order = ["基站名称"]+list(cateDic.keys())+['样本类别']
+    sample = sample[order]
+    return sample
+    
+#经过降采样后生成样本  
+def reSample(filenames,cateDic):#经过降采样后生成样本
+    data=pd.DataFrame(columns=cateDic.keys())
+    resample=pd.DataFrame(columns=["基站名称"]+list(cateDic.keys())+["样本类别"])
+    for i in range(len(filenames)):
+        print("第%d个基站···"%(i+1))
+        df1=pd.read_csv(filenames[i])
+        df1['告警开始时间'] = pd.to_datetime(df1['告警开始时间']) #将数据类型转换为日期类型
+        df1 = df1.set_index('告警开始时间') # 将date设置为index
+        df2=df1.groupby(['告警开始时间','告警名称']).size().unstack().fillna(0).resample("D").sum()#按天聚合数据
+        df2=pd.concat([data,df2]).fillna(0)
+        df3 = pd.DataFrame(columns=list(df2.columns)+["样本类别"])
+        for i in range(df2.shape[0]-7):
+            df3=df3.append(df2[i:i+7][:].cumsum()[6:7])
+            if df2[i+7:i+8]["网元连接中断"].values[0]>=1 or df2[i+7:i+8]["小区不可用告警"].values[0]>=1:
+                df3["样本类别"].iloc[i:i+1]=1
+            else:
+                df3["样本类别"].iloc[i:i+1]=0
+        df3.insert(0,"基站名称",[df1["基站名称"].values[0]]*df3.shape[0])
+        redf3=lower_sample_data(df3, percent=1)
+        resample=pd.concat([resample,redf3])
+    order = ["基站名称"]+list(cateDic.keys())+['样本类别']
+    resample = resample[order]
+    return resample
+    
+def testSet(test_filenames,cateDic):
+    data=pd.DataFrame(columns=cateDic.keys())
+    test_sample=pd.DataFrame(columns=["基站名称"]+list(cateDic.keys()))
+    for i in range(len(test_filenames)):
+        tf1=pd.read_csv(test_filenames[i])
+        tf1['告警开始时间'] = pd.to_datetime(tf1['告警开始时间']) #将数据类型转换为日期类型
+        tf1 = tf1.set_index('告警开始时间') # 将date设置为index
+        tf2=tf1.groupby(['告警开始时间','告警名称']).size().unstack().fillna(0).resample("D").sum()#按天聚合数据
+        tf2=pd.concat([data,tf2]).fillna(0)
+        tf3 =tf2[:][:].cumsum().tail(1)
+        tf3.insert(0,"基站名称",[tf1["基站名称"].values[0]]*tf3.shape[0])
+        test_sample=pd.concat([test_sample,tf3])
+    order = ["基站名称"]+list(cateDic.keys())
+    test_sample= test_sample[order]
+    return test_sample
+
+def train_lgb_model(train_, valid_, valid_2, id_name, label_name, categorical_feature=None, seed=1024, is_shuffle=True):
+    folds = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+    train_['res'] = 0
+    pred = [col for col in train_.columns if col not in [id_name, label_name, 'res']]
+    print('特征数量为：', len(pred))
+    sub_preds = np.zeros((valid_.shape[0], folds.n_splits))
+    sub_preds2 = np.zeros((valid_2.shape[0], folds.n_splits))
+    params = {
+        'learning_rate': 0.01,
+        'boosting_type': 'gbdt',
+        'objective': 'binary',
+        'metric': ['binary_logloss', 'auc'],
+        'num_leaves': 32,
+        'feature_fraction': 0.7,
+        'bagging_fraction': 0.7,
+        'bagging_freq': 5,
+        'seed': 1,
+        # 'device': 'gpu',
+        'bagging_seed': 1,
+        'feature_fraction_seed': 7,
+        'min_data_in_leaf': 28,
+        'nthread': -1,
+        'verbose': -1,
+    }
+    fea_impor = pd.DataFrame()
+    fea_impor['column'] = train_[pred].columns
+    fea_impor['importance'] = 0
+
+    for n_fold, (train_idx, valid_idx) in enumerate(folds.split(train_, train_[label_name]), start=1):
+        print(f'the {n_fold} training start ...')
+
+        train_x, train_y = train_[pred].iloc[train_idx], train_[label_name].iloc[train_idx]
+        valid_x, valid_y = train_[pred].iloc[valid_idx], train_[label_name].iloc[valid_idx]
+
+        dtrain = lgb.Dataset(train_x, label=train_y)
+        dvalid = lgb.Dataset(valid_x, label=valid_y)
+
+        clf = lgb.train(
+            params=params,
+            train_set=dtrain,
+            num_boost_round=1000,
+            valid_sets=[dtrain, dvalid],
+            early_stopping_rounds=100,
+            # feval=fscore,
+            verbose_eval=100,
+        )
+        fea_impor['tmp'] = clf.feature_importance()
+        fea_impor['importance'] = fea_impor['importance'] + fea_impor['tmp']
+
+        sub_preds[:, n_fold - 1] = clf.predict(valid_[pred], num_iteration=clf.best_iteration)
+        sub_preds2[:, n_fold - 1] = clf.predict(valid_2[pred], num_iteration=clf.best_iteration)
+        train_pred = clf.predict(valid_x, num_iteration=clf.best_iteration)
+        tmp_score = roc_auc_score(valid_y, train_pred)
+        train_['res'].iloc[valid_idx] = train_['res'].iloc[valid_idx] + train_pred
+        print(f'Orange roc_auc_score score: {tmp_score}')
+
+    tmp_score = roc_auc_score(train_[label_name], train_['res'])
+    print(f'five flod roc_auc_score score: {tmp_score}')
+    train_.sort_values(by=['res'], ascending=False, inplace=True)
+
+    # 按照0.5划分
+    th = search_threthold(train_[label_name], train_['res'])
+    train_['res'] = train_['res'].apply(lambda x: 1 if x > th else 0)
+
+    tmp_f1 = f1_score(train_[label_name], train_['res'])
+
+    print(f'five flod tmp_f1 score: {th, tmp_f1}')
+
+    valid_[label_name] = np.mean(sub_preds, axis=1)
+    valid_2[label_name] = np.mean(sub_preds2, axis=1)
+
+    valid_['基站名称'] = valid_[id_name]
+    valid_2['基站名称'] = valid_2[id_name]
+
+    valid_['未来24小时发生退服类告警的概率'] = valid_[label_name]
+    valid_2['未来24小时发生退服类告警的概率'] = valid_2[label_name]
+
+    return valid_[['基站名称', '未来24小时发生退服类告警的概率']], valid_2[['基站名称', '未来24小时发生退服类告警的概率']]
+
+online_train_data = get_train_data(all_train_data, start_i=0, times=30)
+all_data = online_train_data.append(all_test_data)
+all_data_fea = gener_fea(all_data)
+tmp = online_train_data.groupby(by=['ID'])['告警名称'].apply(lambda x: ' '.join(x.tolist())).reset_index()
+
+all_data_fea['end_time'] = all_data_fea['end_time'].apply(lambda x:str(x)[:10])
+train_data=all_data_fea[(all_data_fea['end_time']!='2020-03-23') & (all_data_fea['end_time']!='2020-03-31')]
+test1_data=all_data_fea[all_data_fea['end_time']=='2020-03-23']
+test2_data=all_data_fea[all_data_fea['end_time']=='2020-03-31']
+
+cols = [col for col in train_data.columns if col not in ['ID','label','end_time']]
+val1, val2 = train_lgb_model(train_data[cols+['ID','label']], test1_data[cols+['ID']], test2_data[cols+['ID']], 'ID', 'label')
+val1.to_csv('./Sample23_1日.csv', index=False)
+val2.to_csv('./Sample31_1日.csv', index=False)
+
+cols = [col for col in train_data.columns if col not in ['ID','label','end_time']]
+
+val1, val2 = train_lgb_model(train_data[cols+['ID','label']], test1_data[cols+['ID']], test2_data[cols+['ID']], 'ID', 'label')
+val1.to_csv('./Sample23_1日.csv', index=False)
+val2.to_csv('./Sample31_1日.csv', index=False)
+
+
+# 生成提交文件
+sub1 = pd.read_csv('/mnt/5/提交文件样例/Sample23日.csv', encoding='gbk')
+sub2 = pd.read_csv('/mnt/5/提交文件样例/Sample31日.csv', encoding='gbk')
+
+val1['未来24小时发生退服类告警的概率'] = val1['未来24小时发生退服类告警的概率'].apply(lambda x: 1 if x>0.16 else 0)
+val2['未来24小时发生退服类告警的概率'] = val2['未来24小时发生退服类告警的概率'].apply(lambda x: 1 if x>0.16 else 0)
+
+sub1 = sub1[['基站名称']].merge(val1, on='基站名称', how='left')
+sub2 = sub2[['基站名称']].merge(val2, on='基站名称', how='left')
+sub1.to_csv('/root/models/results/Sample23日.csv', index=False)
+sub2.to_csv('/root/models/results/Sample31日.csv', index=False)
